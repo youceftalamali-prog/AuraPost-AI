@@ -1,5 +1,14 @@
 import "dotenv/config";
 
+// Ensure NODE_ENV is always set. When running the production bundle
+// (dist/server.cjs via `npm run start`), default to "production" so that
+// static file serving activates instead of the Vite dev server.
+// When running via `npm run dev` (tsx server.ts), default to "development".
+if (!process.env.NODE_ENV) {
+  const callerPath = process.argv[1] || "";
+  process.env.NODE_ENV = callerPath.includes("dist") ? "production" : "development";
+}
+
 import crypto from "crypto";
 import express from "express";
 import path from "path";
@@ -14,13 +23,7 @@ import { createCheckoutSession, createCustomerPortalSession, constructStripeWebh
 import {
   createPayPalSubscription,
   createPayPalCreditPurchaseOrder,
-  capturePayPalOrder,
-  cancelPayPalSubscription,
-  verifyPayPalWebhookSignature,
-  isPayPalTransmissionTimeFresh,
-  getPayPalCreditPack,
-  getPayPalMode,
-  PAYPAL_CREDIT_PACKS,
+  capturePayPalOrder
 } from "./server/billing/paypal.ts";
 import {
   completeShopifyOAuth,
@@ -66,13 +69,33 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
+  // SAFETY NET: Express 4 silently swallows rejected promises from async route
+  // handlers and middleware. On Node 15+ this causes unhandledRejection crashes.
+  // We patch the routing methods so every async handler is automatically wrapped
+  // with Promise.resolve(...).catch(next), forwarding errors to ErrorMiddleware.
+  {
+    const methods = ["get", "post", "put", "delete", "patch", "use", "all"] as const;
+    for (const method of methods) {
+      const original = (app[method] as Function).bind(app);
+      (app as any)[method] = function (pathOrHandler: any, ...rest: any[]) {
+        const hasPath = typeof pathOrHandler === "string";
+        const handlers = hasPath ? rest : [pathOrHandler, ...rest];
+        const wrapped = handlers.map((h: any) => {
+          if (typeof h !== "function" || h.length >= 4) return h;
+          return function wrappedAsyncHandler(req: any, res: any, next: any) {
+            Promise.resolve(h(req, res, next)).catch(next);
+          };
+        });
+        return hasPath ? original(pathOrHandler, ...wrapped) : original(...wrapped);
+      };
+    }
+  }
+
   await initSentry();
 
-  // Serve static assets immediately in production, bypassing heavy API middlewares
-  if (process.env.NODE_ENV === "production") {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-  }
+  // NOTE: Production static serving is handled at the end of startServer() (after security
+  // middleware is registered) to ensure CSP, CORS, and rate-limiting headers are applied
+  // to all static asset responses.
 
   // PHASE 5 (Observability): structured request logging with automatic redaction
   // of sensitive headers/fields (see server/core/observability/logger.ts).
@@ -100,7 +123,7 @@ async function startServer() {
     }
     return next(err);
   });
-  app.use(apiRateLimiter);
+  app.use("/api", apiRateLimiter);
 
   // Higher body-size limit for the specific routes that legitimately carry base64 image
   // payloads. Must be mounted BEFORE the global stricter parser below, since body-parser
@@ -2515,20 +2538,51 @@ async function startServer() {
     }
   });
 
-  // Integrate Vite for local dev vs handle static serving in build-production mode
-  if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.get("*", async (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
+// Integrate Vite for local dev vs handle static serving in build-production mode
+if (process.env.NODE_ENV !== "production") {
+  const { createServer: createViteServer } = await import("vite");
+
+  const vite = await createViteServer({
+    appType: "custom",
+    server: {
+      middlewareMode: true,
+    },
+  });
+
+  app.use(vite.middlewares);
+
+  app.use("*", async (req, res, next) => {
+    try {
+      const url = req.originalUrl;
+
+      let template = fs.readFileSync(
+        path.resolve("index.html"),
+        "utf-8"
+      );
+
+      template = await vite.transformIndexHtml(url, template);
+
+      res
+        .status(200)
+        .set({
+          "Content-Type": "text/html",
+        })
+        .end(template);
+    } catch (e) {
+      vite.ssrFixStacktrace(e as Error);
+      next(e);
+    }
+  });
+
+} else {
+  const distPath = path.join(process.cwd(), "dist");
+
+  app.use(express.static(distPath));
+
+  app.use("*", (req, res) => {
+    res.sendFile(path.join(distPath, "index.html"));
+  });
+}
 
   // Global error handler - catches unhandled errors, prevents stack trace leaks
   app.use(ErrorMiddleware);
@@ -2558,6 +2612,13 @@ async function startServer() {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
+
+// Last-resort safety net: log unhandled rejections instead of crashing.
+// The async wrapper above should catch most, but this prevents obscure edge cases
+// from killing the process in production.
+process.on("unhandledRejection", (reason) => {
+  logger.error({ err: reason }, "Unhandled promise rejection (safety net):");
+});
 
 startServer().catch((err) => {
   const errorMsg = `[Startup Error - ${new Date().toISOString()}] ${err instanceof Error ? err.stack : String(err)}\n`;

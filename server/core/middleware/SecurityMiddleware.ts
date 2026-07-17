@@ -14,21 +14,28 @@ import type { RequestHandler } from "express";
  */
 
 export function buildHelmetMiddleware(): RequestHandler {
+  // In development, Vite's @vitejs/plugin-react injects an inline <script> containing the
+  // React Refresh runtime preamble. CSP script-src 'self' blocks all inline scripts, causing
+  // the "can't detect preamble" error. Production builds emit only non-inline <script src="...">
+  // bundles, so CSP remains fully enforced there.
+  if (process.env.NODE_ENV !== "production") {
+    return (_req, _res, next) => next();
+  }
+
   return helmet({
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
-        // Vite/React build output is same-origin; no inline eval is required at runtime.
         "default-src": ["'self'"],
         "img-src": ["'self'", "data:", "https:"],
         "connect-src": ["'self'", "https:"],
         "script-src": ["'self'"],
-        "style-src": ["'self'", "'unsafe-inline'"], // Tailwind/utility classes rely on inline style attrs in places
+        "style-src": ["'self'", "'unsafe-inline'"],
         "object-src": ["'none'"],
         "frame-ancestors": ["'none'"],
       },
     },
-    crossOriginEmbedderPolicy: false, // would break third-party (Shopify/Stripe/Meta) asset loading
+    crossOriginEmbedderPolicy: false,
   });
 }
 
