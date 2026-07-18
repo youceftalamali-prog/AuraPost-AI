@@ -1,23 +1,39 @@
-import tailwindcss from '@tailwindcss/vite';
-import react from '@vitejs/plugin-react';
-import path from 'path';
-import {defineConfig} from 'vite';
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "path";
 
-const framerMotionCjs = path.resolve(__dirname, 'node_modules/framer-motion/dist/cjs/index.js');
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
 
-export default defineConfig(() => {
-  return {
-    plugins: [react(), tailwindcss()],
-    resolve: {
-      alias: {
-        '@': path.resolve(__dirname, '.'),
-        'motion/react': framerMotionCjs,
-        'framer-motion': framerMotionCjs,
-      },
-    },
-    server: {
-      hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
-    },
-  };
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "."),
+
+      "framer-motion": path.resolve(
+        __dirname,
+        "node_modules/framer-motion/dist/cjs/index.js"
+      ),
+
+      "motion/react": path.resolve(
+        __dirname,
+        "node_modules/motion/dist/cjs/react.js"
+      ),
+
+      "motion/react-client": path.resolve(
+        __dirname,
+        "node_modules/motion/dist/cjs/react-client.js"
+      ),
+
+      "motion/react-mini": path.resolve(
+        __dirname,
+        "node_modules/motion/dist/cjs/react-mini.js"
+      ),
+
+      "motion/react-m": path.resolve(
+        __dirname,
+        "node_modules/motion/dist/cjs/react-m.js"
+      )
+    }
+  }
 });

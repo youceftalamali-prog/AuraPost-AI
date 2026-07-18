@@ -2468,10 +2468,7 @@ export class DatabaseManager {
   public async updateVideoGeneration(
     workspaceId: string,
     videoId: string,
-    patch: Partial<Pick<
-      VideoGenerationRecord,
-      "provider" | "status" | "progress" | "videoUrl" | "thumbnailUrl" | "downloadUrl" | "errorMessage" | "completedAt" | "scenes"
-    >>
+    patch: Partial<VideoGenerationRecord>
   ): Promise<VideoGenerationRecord | null> {
     const existing = await this.getVideoGenerationById(workspaceId, videoId);
     if (!existing) {
@@ -2480,15 +2477,10 @@ export class DatabaseManager {
 
     const updated: VideoGenerationRecord = {
       ...existing,
-      provider: patch.provider ?? existing.provider,
-      status: patch.status ?? existing.status,
-      progress: patch.progress ?? existing.progress,
-      videoUrl: patch.videoUrl ?? existing.videoUrl,
-      thumbnailUrl: patch.thumbnailUrl ?? existing.thumbnailUrl,
-      downloadUrl: patch.downloadUrl ?? existing.downloadUrl,
-      errorMessage: patch.errorMessage,
-      completedAt: patch.completedAt ?? existing.completedAt,
-      scenes: patch.scenes ?? existing.scenes,
+      ...patch,
+      id: existing.id,
+      workspaceId: existing.workspaceId,
+      productId: existing.productId,
       updatedAt: new Date().toISOString(),
     };
 

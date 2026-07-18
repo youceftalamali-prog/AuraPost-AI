@@ -55,6 +55,7 @@ import {
 } from "./src/types.ts";
 import { buildVideoAnalytics, createVideoDraft } from "./server/video/studio.ts";
 import { getDefaultFallbackChain, getVideoProviders } from "./server/video/provider.ts";
+import { initializeTemplateRoutes } from "./server/video/template-routes.ts";
 import { getBillingPlan } from "./server/billing/plans.ts";
 import authRouter from "./server/identity/routes/auth.routes.ts";
 import { ImageStudioService } from "./server/ai/image-studio.ts";
@@ -1947,12 +1948,18 @@ async function startServer() {
 
   // --- AI Video Studio Endpoints (Phase 5) ---
 
+  // Initialize template marketplace routes
+  await initializeTemplateRoutes(app);
+
+  // Additional video platform endpoints
   app.get("/api/video/providers", async (req, res) => {
+    const providers = getVideoProviders();
     return res.json({
-      providers: getVideoProviders().map((provider) => ({
+      providers: providers.map((provider) => ({
         name: provider.name,
         label: provider.label,
         mode: provider.mode,
+        available: provider.isAvailable(),
       })),
       fallbackChain: getDefaultFallbackChain(),
       templates: supportedVideoTemplates,
@@ -2061,6 +2068,328 @@ async function startServer() {
     const workspaceId = (req.query.workspaceId as string) || (req as any).workspaceId;
     const success = await db.deleteVideoGeneration(workspaceId, req.params.videoId);
     return success ? res.json({ success: true }) : res.status(404).json({ error: "AI video generation not found." });
+  });
+
+  // ─── RENDER QUEUE MANAGEMENT ──────────────────────────────────
+
+  app.get("/api/video/queue/workspace", async (req, res) => {
+    try {
+      const workspaceId = req.query.workspaceId as string;
+      if (!workspaceId) return res.status(400).json({ error: "workspaceId required" });
+      const allItems = await db.getWorkspaceVideoGenerations(workspaceId);
+      const queue = allItems.filter((item) => item.status === "queued" || item.status === "rendering");
+      const sorted = queue.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      return res.json({ queue: sorted, total: sorted.length });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/video/regenerate", aiGenerationRateLimiter, async (req, res) => {
+    try {
+      const { workspaceId, videoId } = req.body;
+      if (!workspaceId || !videoId) return res.status(400).json({ error: "workspaceId and videoId required" });
+      const existing = await db.getVideoGenerationById(workspaceId, videoId);
+      if (!existing) return res.status(404).json({ error: "Video generation not found" });
+      const products = await db.getProducts(workspaceId);
+      const product = products.find((p) => p.id === existing.productId);
+      if (!product) return res.status(404).json({ error: "Product not found" });
+      const estimatedCredits = existing.creditsUsed;
+      if (!await db.checkCreditBalance(workspaceId, estimatedCredits, "video")) {
+        return await sendInsufficientCredits(res, workspaceId, "video", estimatedCredits);
+      }
+      const analysis = await db.getLatestProductAnalysis(existing.productId);
+      const latestContent = await db.getLatestContentGeneration(existing.productId);
+      const draft = await createVideoDraft(db, {
+        workspaceId, product, analysis, latestContent,
+        template: existing.template, outputType: existing.outputType, inputMode: existing.inputMode,
+        prompt: existing.prompt, durationSeconds: existing.durationSeconds, aspectRatio: existing.aspectRatio,
+        provider: existing.provider as VideoProviderName | undefined,
+        sourceImageUrls: existing.sourceImageUrls,
+      });
+      const queueJob = await enqueueQueueJob(workspaceId, "ai_video_rendering", draft.id, {
+        workspaceId, generationId: draft.id,
+      }, { workerName: "video-worker", priority: 8, maxAttempts: 4, backoffMs: 3000 });
+      return res.status(202).json({ success: true, generation: draft, queueJob });
+    } catch (err: any) {
+      logger.error({ err }, "[Video] Failed to regenerate video");
+      return res.status(500).json({ error: err.message || "Failed to regenerate video" });
+    }
+  });
+
+  app.post("/api/video/duplicate", async (req, res) => {
+    try {
+      const { workspaceId, videoId } = req.body;
+      if (!workspaceId || !videoId) return res.status(400).json({ error: "workspaceId and videoId required" });
+      const existing = await db.getVideoGenerationById(workspaceId, videoId);
+      if (!existing) return res.status(404).json({ error: "Video generation not found" });
+      const draft = await db.saveVideoGeneration(workspaceId, existing.productId, {
+        id: undefined as any,
+        productId: existing.productId,
+        workspaceId: existing.workspaceId,
+        template: existing.template,
+        outputType: existing.outputType,
+        inputMode: existing.inputMode,
+        prompt: existing.prompt,
+        provider: existing.provider,
+        providerFallbackChain: existing.providerFallbackChain,
+        aspectRatio: existing.aspectRatio,
+        durationSeconds: existing.durationSeconds,
+        status: "draft",
+        progress: 0,
+        creditsUsed: existing.creditsUsed,
+        estimatedRenderSeconds: existing.estimatedRenderSeconds,
+        sourceGenerationId: existing.sourceGenerationId,
+        sourceAnalysisId: existing.sourceAnalysisId,
+        sourceImageUrls: existing.sourceImageUrls,
+        title: `${existing.title} (Copy)`,
+        videoUrl: undefined,
+        thumbnailUrl: existing.thumbnailUrl,
+        downloadUrl: undefined,
+        errorMessage: undefined,
+        scenes: existing.scenes,
+        completedAt: undefined,
+      });
+      return res.json({ success: true, generation: draft });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message || "Failed to duplicate video" });
+    }
+  });
+
+  // ─── STORYBOARD ENDPOINTS ─────────────────────────────────────
+
+  app.get("/api/video/:videoId/storyboard", async (req, res) => {
+    try {
+      const { workspaceId } = req.query;
+      const video = await db.getVideoGenerationById((workspaceId as string) || "", req.params.videoId);
+      if (!video) return res.status(404).json({ error: "Video not found" });
+      return res.json({ storyboard: video.storyboard || null, scenes: video.scenes || [] });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put("/api/video/:videoId/storyboard", async (req, res) => {
+    try {
+      const { workspaceId, storyboard, scenes } = req.body;
+      if (!workspaceId) return res.status(400).json({ error: "workspaceId required" });
+      await db.updateVideoGeneration(workspaceId, req.params.videoId, {
+        ...(storyboard ? { storyboard } : {}),
+        ...(scenes ? { scenes } : {}),
+      });
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ─── TIMELINE ENDPOINTS ───────────────────────────────────────
+
+  app.get("/api/video/:videoId/timeline", async (req, res) => {
+    try {
+      const { workspaceId } = req.query;
+      const video = await db.getVideoGenerationById((workspaceId as string) || "", req.params.videoId);
+      if (!video) return res.status(404).json({ error: "Video not found" });
+      return res.json({ timeline: video.timeline || [] });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put("/api/video/:videoId/timeline", async (req, res) => {
+    try {
+      const { workspaceId, timeline } = req.body;
+      if (!workspaceId || !timeline) return res.status(400).json({ error: "workspaceId and timeline required" });
+      await db.updateVideoGeneration(workspaceId, req.params.videoId, { timeline });
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ─── SUBTITLES ENDPOINTS ──────────────────────────────────────
+
+  app.get("/api/video/:videoId/subtitles", async (req, res) => {
+    try {
+      const { workspaceId } = req.query;
+      const video = await db.getVideoGenerationById((workspaceId as string) || "", req.params.videoId);
+      if (!video) return res.status(404).json({ error: "Video not found" });
+      return res.json({ subtitles: video.subtitles || [] });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put("/api/video/:videoId/subtitles", async (req, res) => {
+    try {
+      const { workspaceId, subtitles } = req.body;
+      if (!workspaceId) return res.status(400).json({ error: "workspaceId required" });
+      await db.updateVideoGeneration(workspaceId, req.params.videoId, { subtitles: subtitles || [] });
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/video/:videoId/subtitles/auto-generate", aiGenerationRateLimiter, async (req, res) => {
+    try {
+      const { workspaceId, language } = req.body;
+      const video = await db.getVideoGenerationById(workspaceId, req.params.videoId);
+      if (!video) return res.status(404).json({ error: "Video not found" });
+      const autoSubtitles = (video.scenes || []).map((scene, idx) => ({
+        id: `sub_${idx}_${Date.now()}`,
+        startTime: (video.scenes || []).slice(0, idx).reduce((sum, s) => sum + s.durationSeconds, 0),
+        endTime: (video.scenes || []).slice(0, idx + 1).reduce((sum, s) => sum + s.durationSeconds, 0),
+        text: scene.narration || scene.visual,
+        style: { fontFamily: "Inter", fontSize: 16, color: "#ffffff", position: "bottom" as const, background: "rgba(0,0,0,0.6)" },
+      }));
+      await db.updateVideoGeneration(workspaceId, req.params.videoId, { subtitles: autoSubtitles });
+      return res.json({ success: true, subtitles: autoSubtitles });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ─── BRAND ASSETS ENDPOINTS ───────────────────────────────────
+
+  const brandAssets: Record<string, Array<{
+    id: string; type: string; name: string; url?: string; data?: string;
+    colors?: string[]; fonts?: string[]; workspaceId: string; createdAt: string;
+  }>> = {};
+
+  app.get("/api/video/brand-assets", (req, res) => {
+    try {
+      const workspaceId = req.query.workspaceId as string;
+      if (!workspaceId) return res.status(400).json({ error: "workspaceId required" });
+      return res.json({ assets: brandAssets[workspaceId] || [] });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/video/brand-assets", (req, res) => {
+    try {
+      const { workspaceId, type, name, url, data, colors, fonts } = req.body;
+      if (!workspaceId || !type || !name) return res.status(400).json({ error: "workspaceId, type, name required" });
+      if (!brandAssets[workspaceId]) brandAssets[workspaceId] = [];
+      const asset = {
+        id: `asset_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type, name, url, data, colors, fonts, workspaceId,
+        createdAt: new Date().toISOString(),
+      };
+      brandAssets[workspaceId].push(asset);
+      return res.json({ asset });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete("/api/video/brand-assets/:assetId", (req, res) => {
+    try {
+      const { workspaceId } = req.body;
+      if (!workspaceId) return res.status(400).json({ error: "workspaceId required" });
+      const assets = brandAssets[workspaceId];
+      if (!assets) return res.status(404).json({ error: "Asset not found" });
+      const idx = assets.findIndex((a) => a.id === req.params.assetId);
+      if (idx < 0) return res.status(404).json({ error: "Asset not found" });
+      assets.splice(idx, 1);
+      return res.json({ success: true });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ─── COLOR GRADING / CAMERA / AUDIO PRESETS ──────────────────
+
+  app.get("/api/video/presets", (_req, res) => {
+    res.json({
+      colorGrading: [
+        { name: "Cinematic Warm", brightness: 0, contrast: 15, saturation: -5, warmth: 20, tint: 5, highlights: 10, shadows: -10, vignette: 15 },
+        { name: "Cool & Moody", brightness: -5, contrast: 20, saturation: -15, warmth: -20, tint: 10, highlights: -10, shadows: -20, vignette: 25 },
+        { name: "Vibrant Pop", brightness: 5, contrast: 10, saturation: 20, warmth: 5, tint: 0, highlights: 15, shadows: -5, vignette: 5 },
+        { name: "Soft Glow", brightness: 10, contrast: -5, saturation: -10, warmth: 15, tint: -5, highlights: 20, shadows: 5, vignette: 10 },
+        { name: "Film Noir", brightness: -10, contrast: 30, saturation: -25, warmth: -10, tint: 0, highlights: -15, shadows: -30, vignette: 30 },
+        { name: "Golden Hour", brightness: 5, contrast: 5, saturation: 10, warmth: 30, tint: 5, highlights: 15, shadows: 0, vignette: 10 },
+        { name: "Clean & Natural", brightness: 0, contrast: 5, saturation: 0, warmth: 0, tint: 0, highlights: 5, shadows: -5, vignette: 0 },
+        { name: "Retro Vintage", brightness: 5, contrast: -10, saturation: -20, warmth: 15, tint: 10, highlights: 5, shadows: -5, vignette: 20 },
+      ],
+      cameraPresets: [
+        { name: "Cinematic Dolly", angle: "eye-level", movement: "dolly-in", zoom: 1.0, focus: "subject", depthOfField: 0.8, stabilization: true },
+        { name: "Dynamic Action", angle: "low-angle", movement: "tracking", zoom: 1.2, focus: "subject", depthOfField: 0.5, stabilization: true },
+        { name: "Aerial Sweep", angle: "bird's-eye", movement: "sweeping-pan", zoom: 0.8, focus: "landscape", depthOfField: 0.9, stabilization: true },
+        { name: "Intimate Close-up", angle: "close-up", movement: "subtle-zoom", zoom: 2.0, focus: "detail", depthOfField: 0.3, stabilization: false },
+        { name: "Steady Lockdown", angle: "eye-level", movement: "locked-off", zoom: 1.0, focus: "subject", depthOfField: 0.6, stabilization: true },
+        { name: "Handheld Energy", angle: "shoulder", movement: "handheld", zoom: 1.0, focus: "subject", depthOfField: 0.5, stabilization: false },
+        { name: "Dutch Angle", angle: "dutch", movement: "static", zoom: 1.0, focus: "subject", depthOfField: 0.7, stabilization: true },
+        { name: "POV Shot", angle: "first-person", movement: "walking", zoom: 1.0, focus: "scene", depthOfField: 0.6, stabilization: true },
+      ],
+      motionPresets: [
+        { id: "smooth_slow", name: "Smooth & Slow", type: "entrance", duration: 1.5, easing: "ease-in-out", properties: { opacity: [0, 1], scale: [0.95, 1] } },
+        { id: "quick_pop", name: "Quick Pop", type: "entrance", duration: 0.5, easing: "ease-out", properties: { opacity: [0, 1], scale: [0.8, 1.05, 1] } },
+        { id: "slide_left", name: "Slide from Left", type: "entrance", duration: 0.8, easing: "ease-out", properties: { x: [-100, 0], opacity: [0, 1] } },
+        { id: "slide_right", name: "Slide from Right", type: "entrance", duration: 0.8, easing: "ease-out", properties: { x: [100, 0], opacity: [0, 1] } },
+        { id: "fade_out", name: "Fade Out", type: "exit", duration: 0.6, easing: "ease-in", properties: { opacity: [1, 0] } },
+        { id: "zoom_out", name: "Zoom Out", type: "exit", duration: 0.6, easing: "ease-in", properties: { opacity: [1, 0], scale: [1, 1.2] } },
+        { id: "bounce", name: "Bounce In", type: "entrance", duration: 1.0, easing: "ease-out", properties: { opacity: [0, 1], scale: [0.5, 1.1, 1] } },
+        { id: "flip", name: "Flip In", type: "entrance", duration: 1.0, easing: "ease-in-out", properties: { rotateY: [-90, 0], opacity: [0, 1] } },
+      ],
+      transitionPresets: [
+        { id: "cut", name: "Cut", type: "cut", duration: 0 },
+        { id: "fade", name: "Cross Fade", type: "fade", duration: 0.5 },
+        { id: "dissolve", name: "Dissolve", type: "dissolve", duration: 0.8 },
+        { id: "wipe_left", name: "Wipe Left", type: "wipe", duration: 0.6, direction: "left" },
+        { id: "wipe_right", name: "Wipe Right", type: "wipe", duration: 0.6, direction: "right" },
+        { id: "slide_up", name: "Slide Up", type: "slide", duration: 0.5, direction: "up" },
+        { id: "zoom_in", name: "Zoom In", type: "zoom", duration: 0.6, direction: "in" },
+        { id: "morph", name: "Morph Cut", type: "morph", duration: 1.0 },
+      ],
+      musicGenres: [
+        "Cinematic Orchestral", "Ambient Electronic", "Upbeat Pop", "Hip Hop Beats",
+        "Acoustic Folk", "Jazz Lounge", "Classical Piano", "Rock Anthem",
+        "World Music", "Lofi Study", "R&B Soul", "Latin Rhythm",
+        "Corporate Professional", "Inspirational", "Tropical House", "Synthwave",
+      ],
+      voiceStyles: [
+        "Professional Narrator (Male)", "Professional Narrator (Female)",
+        "Energetic Host (Male)", "Energetic Host (Female)",
+        "Warm Storyteller (Male)", "Warm Storyteller (Female)",
+        "Authoritative Voice (Male)", "Authoritative Voice (Female)",
+        "Friendly Conversational", "Luxury Elegant",
+        "Youthful Trendy", "Calm Meditation",
+        "Deep Cinematic", "Technical Expert",
+      ],
+    });
+  });
+
+  // ─── FAVORITE VIDEOS ──────────────────────────────────────────
+
+  const userVideoFavorites: Record<string, Set<string>> = {};
+
+  app.post("/api/video/favorite/toggle", (req, res) => {
+    try {
+      const { workspaceId, videoId } = req.body;
+      if (!workspaceId || !videoId) return res.status(400).json({ error: "workspaceId and videoId required" });
+      if (!userVideoFavorites[workspaceId]) userVideoFavorites[workspaceId] = new Set();
+      if (userVideoFavorites[workspaceId].has(videoId)) {
+        userVideoFavorites[workspaceId].delete(videoId);
+        return res.json({ favorited: false });
+      } else {
+        userVideoFavorites[workspaceId].add(videoId);
+        return res.json({ favorited: true });
+      }
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/video/favorites/list", (req, res) => {
+    try {
+      const workspaceId = req.query.workspaceId as string;
+      if (!workspaceId) return res.status(400).json({ error: "workspaceId required" });
+      return res.json({ ids: Array.from(userVideoFavorites[workspaceId] || []) });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
   });
 
   app.get("/api/queue/overview", async (req, res) => {

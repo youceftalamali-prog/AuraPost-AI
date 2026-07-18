@@ -726,6 +726,13 @@ export interface VideoScene {
   visual: string;
   narration: string;
   durationSeconds: number;
+  transition?: string;
+  cameraAngle?: string;
+  cameraMovement?: string;
+  lighting?: string;
+  musicStyle?: string;
+  voiceStyle?: string;
+  textOverlays?: Array<{ text: string; position: string; timing: string }>;
 }
 
 export interface ProviderHealthMetric {
@@ -766,6 +773,25 @@ export interface VideoGenerationRecord {
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
+  // New fields
+  templateId?: string;
+  storyboard?: StoryboardFrame[];
+  timeline?: TimelineTrack[];
+  musicTrack?: string;
+  voiceoverTrack?: string;
+  subtitles?: SubtitleCue[];
+  brandAssets?: BrandAsset[];
+  colorGrading?: ColorGradingPreset;
+  motionPreset?: string;
+  animationPreset?: string;
+  cameraConfig?: CameraConfig;
+  logoOverlay?: LogoOverlay;
+  watermark?: WatermarkConfig;
+  isFavorite?: boolean;
+  collectionIds?: string[];
+  rating?: number;
+  renderDuration?: number;
+  outputSize?: number;
 }
 
 export interface VideoStudioAnalytics {
@@ -775,6 +801,197 @@ export interface VideoStudioAnalytics {
   averageRenderTime: number;
   creditsUsed: number;
   providerPerformance: ProviderHealthMetric[];
+}
+
+// --- New Video Platform Types ---
+
+export interface StoryboardFrame {
+  id: string;
+  sceneIndex: number;
+  visual: string;
+  narration: string;
+  durationSeconds: number;
+  thumbnail?: string;
+  notes?: string;
+}
+
+export interface TimelineTrack {
+  id: string;
+  type: "video" | "audio" | "text" | "overlay" | "transition";
+  name: string;
+  clips: TimelineClip[];
+  muted?: boolean;
+  locked?: boolean;
+}
+
+export interface TimelineClip {
+  id: string;
+  startTime: number;
+  endTime: number;
+  sourceType: "scene" | "music" | "voiceover" | "image" | "text" | "overlay";
+  sourceId: string;
+  label: string;
+  thumbnail?: string;
+  volume?: number;
+  speed?: number;
+  fadeIn?: number;
+  fadeOut?: number;
+  effects?: string[];
+}
+
+export interface SubtitleCue {
+  id: string;
+  startTime: number;
+  endTime: number;
+  text: string;
+  style?: {
+    fontFamily?: string;
+    fontSize?: number;
+    color?: string;
+    position?: "top" | "bottom" | "center";
+    background?: string;
+  };
+}
+
+export interface BrandAsset {
+  id: string;
+  type: "logo" | "font" | "color" | "image" | "video" | "audio";
+  name: string;
+  url?: string;
+  data?: string;
+  colors?: string[];
+  fonts?: string[];
+  workspaceId: string;
+  createdAt: string;
+}
+
+export interface ColorGradingPreset {
+  name: string;
+  brightness: number;
+  contrast: number;
+  saturation: number;
+  warmth: number;
+  tint: number;
+  highlights: number;
+  shadows: number;
+  vignette: number;
+  lut?: string;
+}
+
+export interface CameraConfig {
+  angle: string;
+  movement: string;
+  zoom: number;
+  focus: string;
+  depthOfField: number;
+  stabilization: boolean;
+}
+
+export interface LogoOverlay {
+  enabled: boolean;
+  url?: string;
+  position: "top-left" | "top-right" | "bottom-left" | "bottom-right" | "center";
+  scale: number;
+  opacity: number;
+  animation?: "fade" | "slide" | "none";
+}
+
+export interface WatermarkConfig {
+  enabled: boolean;
+  text?: string;
+  position: "top-left" | "top-right" | "bottom-left" | "bottom-right" | "center";
+  opacity: number;
+  fontSize: number;
+}
+
+export interface VideoCollection {
+  id: string;
+  workspaceId: string;
+  name: string;
+  description?: string;
+  coverUrl?: string;
+  templateIds: string[];
+  videoIds: string[];
+  isPublic: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VideoTemplateRating {
+  templateId: string;
+  workspaceId: string;
+  rating: number;
+  review?: string;
+  createdAt: string;
+}
+
+export interface VideoTemplateAnalytics {
+  templateId: string;
+  totalRenders: number;
+  completedRenders: number;
+  failedRenders: number;
+  averageRating: number;
+  totalRatings: number;
+  popularityScore: number;
+  topProviders: Array<{ provider: string; count: number }>;
+  averageDuration: number;
+}
+
+export interface TemplateCategory {
+  name: string;
+  count: number;
+  industries: string[];
+  subcategories?: TemplateCategory[];
+  coverUrl?: string;
+  description?: string;
+}
+
+export interface RenderQueueItem {
+  id: string;
+  videoId: string;
+  workspaceId: string;
+  status: VideoRenderStatus;
+  progress: number;
+  priority: number;
+  title: string;
+  template: string;
+  provider: string;
+  estimatedRenderSeconds: number;
+  createdAt: string;
+  completedAt?: string;
+  errorMessage?: string;
+}
+
+export interface DownloadItem {
+  id: string;
+  videoId: string;
+  workspaceId: string;
+  format: "mp4" | "webm" | "gif";
+  quality: "draft" | "standard" | "premium" | "ultra";
+  status: "preparing" | "ready" | "downloading" | "completed" | "failed";
+  url?: string;
+  fileSize?: number;
+  createdAt: string;
+  completedAt?: string;
+}
+
+export interface AnimationPreset {
+  id: string;
+  name: string;
+  description: string;
+  type: "entrance" | "exit" | "emphasis" | "transition";
+  duration: number;
+  easing: string;
+  properties: Record<string, any>;
+}
+
+export interface TransitionPreset {
+  id: string;
+  name: string;
+  type: "cut" | "fade" | "dissolve" | "wipe" | "slide" | "zoom" | "morph" | "custom";
+  duration: number;
+  direction?: "left" | "right" | "up" | "down" | "in" | "out";
+  easing?: string;
 }
 
 export type AnalyticsDatePreset = "today" | "7d" | "30d" | "90d" | "custom";

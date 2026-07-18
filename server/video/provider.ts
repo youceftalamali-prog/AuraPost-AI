@@ -385,6 +385,71 @@ class PikaProvider extends BaseVideoProvider {
   }
 }
 
+class LumaProvider extends BaseVideoProvider {
+  public name: VideoProviderName = "luma";
+  public label = "Luma";
+
+  protected getApiKey(): string | undefined {
+    return process.env.LUMA_API_KEY;
+  }
+
+  public async render(request: VideoRenderRequest) {
+    const apiKey = this.requireApiKey("LUMA_API_KEY");
+    const scenes = buildScenes(request);
+
+    const startResponse = await fetch("https://api.lumalabs.ai/v1/video/generate", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        prompt: request.prompt,
+        aspect_ratio: request.aspectRatio === "9:16" ? "9:16" : "16:9",
+        duration: Math.min(10, Math.max(5, request.durationSeconds)),
+      }),
+    });
+
+    if (!startResponse.ok) {
+      const errBody = await startResponse.text();
+      throw new Error(`Luma request failed (HTTP ${startResponse.status}): ${errBody || startResponse.statusText}`);
+    }
+
+    const task = await startResponse.json() as { id: string };
+
+    const result = await pollLongRunningOperation<{ videoUrl: string }>(
+      async () => {
+        const pollResponse = await fetch(`https://api.lumalabs.ai/v1/video/generate/${task.id}`, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+        });
+        if (!pollResponse.ok) {
+          return { done: false, error: `Luma polling failed (HTTP ${pollResponse.status}).` };
+        }
+        const pollJson = await pollResponse.json() as {
+          status: string;
+          result?: { url: string };
+          error?: string;
+        };
+        if (pollJson.status === "failed" || pollJson.error) {
+          return { done: true, error: pollJson.error || "Luma generation failed." };
+        }
+        if (pollJson.status === "completed" && pollJson.result?.url) {
+          return { done: true, result: { videoUrl: pollJson.result.url } };
+        }
+        return { done: false };
+      },
+      180000
+    );
+
+    return {
+      videoUrl: result.videoUrl,
+      thumbnailUrl: getThumbnail(request),
+      downloadUrl: result.videoUrl,
+      scenes,
+    };
+  }
+}
+
 export function getVideoProviders(): VideoProvider[] {
   const liveMode = process.env.VIDEO_PROVIDER_LIVE === "true";
   const mode: "sandbox" | "live" = liveMode ? "live" : "sandbox";
@@ -393,6 +458,7 @@ export function getVideoProviders(): VideoProvider[] {
     new RunwayProvider(mode),
     new KlingProvider(mode),
     new PikaProvider(mode),
+    new LumaProvider(mode),
   ];
 }
 
@@ -405,7 +471,7 @@ export function getProviderByName(name: VideoProviderName): VideoProvider {
 }
 
 export function getDefaultFallbackChain(): VideoProviderName[] {
-  return ["google_veo", "runwayml", "kling_ai", "pika_labs"];
+  return ["google_veo", "runwayml", "kling_ai", "luma", "pika_labs"];
 }
 
 export async function completeVideoRender(

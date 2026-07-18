@@ -17,7 +17,7 @@ if (!fs.existsSync(pkgJsonPath)) {
   process.exit(0);
 }
 
-const raw = fs.readFileSync(pkgJsonPath, 'utf8');
+const raw = fs.readFileSync(pkgJsonPath, 'utf8').replace(/^\uFEFF/, '');
 const pkg = JSON.parse(raw);
 
 // If already patched, skip
@@ -39,7 +39,7 @@ if (fs.existsSync(esDir)) {
 for (const dep of ['motion-dom', 'motion-utils']) {
   const depPkgPath = path.join(__dirname, '..', 'node_modules', dep, 'package.json');
   if (fs.existsSync(depPkgPath)) {
-    const depRaw = fs.readFileSync(depPkgPath, 'utf8');
+    const depRaw = fs.readFileSync(depPkgPath, 'utf8').replace(/^\uFEFF/, '');
     const depPkg = JSON.parse(depRaw);
     if (depPkg.module || depPkg.exports) {
       delete depPkg.module;
